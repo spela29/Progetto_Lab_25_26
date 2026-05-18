@@ -7,7 +7,7 @@
 /*
 file sorgente per la gestione di code con modello produttore consumatore
 */
-int mr_queue_init(mr_queue_info* q,size_t capacita){
+int mr_queue_init(mr_queue_t* q,size_t capacita){
     if(capacita == 0){
         errno = EINVAL;
         perror("errore capaicta coda <1\n");
@@ -46,7 +46,7 @@ int mr_queue_init(mr_queue_info* q,size_t capacita){
     return 0;
 }
 
-int mr_queue_destroy(mr_queue_info* q){
+int mr_queue_destroy(mr_queue_t* q){
     free(q->items);
     q->items = NULL;
     mtx_destroy(&q->mutex);
@@ -55,7 +55,7 @@ int mr_queue_destroy(mr_queue_info* q){
     return 0;
 }
 
-int mr_queue_push(mr_queue_info* q,void* item){
+int mr_queue_push(mr_queue_t* q,void* item){
     mtx_lock(&q->mutex);
     while(q->elementi == q->capacita && q->close == 0){
         cnd_wait(&q->not_full,&q->mutex);
@@ -72,7 +72,7 @@ int mr_queue_push(mr_queue_info* q,void* item){
     return 0;
 }
 
-void* mr_queue_pop(mr_queue_info* q){
+void* mr_queue_pop(mr_queue_t* q){
     mtx_lock(&q->mutex);
     while(q->elementi == 0 && q->close == 0){
         cnd_wait(&q->not_empty,&q->mutex);
@@ -88,7 +88,7 @@ void* mr_queue_pop(mr_queue_info* q){
 
 }
 
-void mr_queue_close(mr_queue_info* q){
+void mr_queue_close(mr_queue_t* q){
     mtx_lock(&q->mutex);
     q->close = 1;
     cnd_broadcast(&q->not_empty);
