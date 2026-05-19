@@ -94,7 +94,7 @@ int mr_send_line(int fd,
 
 /*
 mr_recv_line e la funzione che fa coppia con mr_send_line perche è quella che si occupa 
-della ricezione e dell'organizzazione delle informazione che poi serciranno 
+della ricezione e dell'organizzazione delle informazione che poi serviranno 
 ai thread worker mapper per la risoctruzione della riga logica prima dell'invio 
 della stessa nella funzione mapper passata dal programma utente 
 si ferma in 4 casi:
@@ -188,7 +188,9 @@ non ritorna
 */
 void mr_queue_close(mr_queue_t* q);
 
-
+//=======================SEZIONE_MAPPER=====================================
+void mapper_process_main(mr_mapper_t mapper_fn, void *user_arg,
+                         size_t num_threads, size_t queue_size);
 
 //=======================SEZIONE_ANCORA_DA_IMPLEMENTARE=====================================
 /*
@@ -202,17 +204,7 @@ struct mr
     mr_reducer_t reducer;//callback reducer fornita dall'utente
     void* user_arg;// argomento opaco passato alle callback
 };
-/*
-questa struct indica gli argomenti passati ai thread worker del processo mapper
-*/
 
-typedef struct {
-    mr_queue_t  *queue;        //coda delle righe da elaborare 
-    mr_mapper_t  mapper_fn;    //callback mapper utente 
-    void        *user_arg;
-    int          out_fd;       //fd di scrittura verso il reducer
-    mtx_t       *write_mutex;  // mutex condiviso per serializzare le scritture
-} mapper_worker_arg_t;
 
 /*
 Un gruppo raccoglie tutti i valori associati a uno stesso token,
