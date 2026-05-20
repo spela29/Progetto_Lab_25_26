@@ -73,7 +73,7 @@ mandando le copie grazie alla funzione mr_send_pair()
  */
 typedef struct {
     mtx_t *write_mutex;
-}emit_arg_t;
+}mapper_emit_arg_t;
 
 /*
 Funzione emit passata alla callback mapper utente.
@@ -83,7 +83,7 @@ La scrittura è protetta dal mutex per evitare interleaving tra thread.
 static int mapper_emit(const char *token, const void *value,
                        size_t value_size, void *arg)
 {
-    emit_arg_t *ea = (emit_arg_t *)arg;
+    mapper_emit_arg_t *ea = (mapper_emit_arg_t *)arg;
 
     size_t token_len = strlen(token);
 
@@ -148,14 +148,14 @@ static int mapper_worker_main(void *arg)
 {
     mapper_worker_arg_t *wa = (mapper_worker_arg_t *)arg;
 
-    emit_arg_t ea;
+    mapper_emit_arg_t ea;
     ea.write_mutex = wa->write_mutex;
 
     while(1){
         mapper_line_t *ml = (mapper_line_t *)mr_queue_pop(wa->queue);
         if (ml == NULL) break;   //coda vuota e chiusa: fine lavoro 
 
-        //Ricostruisce la struttura pubblica mr_file_line_t 
+        //Ricostruisce la struttura pubblica mr_file_line_t (riga logica)
         mr_file_line_t fl;
         fl.file_name     = ml->file_name;
         fl.file_name_len = ml->file_name_len;

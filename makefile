@@ -1,5 +1,5 @@
 CC      = gcc #compilatore
-CFLAGS  = -std=c11 -Wall -Wextra -g -I include -I src #flags usati
+CFLAGS  = -std=c11 -Wall -Wextra  -g -I include -I src #flags usati
 AR      = ar # Programma per creare librerie statiche
 ARFLAGS = rcs # r = inserisci/aggiorna, c = crea se non esiste, s = aggiungi indice
 

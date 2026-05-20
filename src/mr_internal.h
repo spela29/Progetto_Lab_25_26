@@ -192,6 +192,12 @@ void mr_queue_close(mr_queue_t* q);
 void mapper_process_main(mr_mapper_t mapper_fn, void *user_arg,
                          size_t num_threads, size_t queue_size);
 
+
+//=======================SEZIONE_REDUCER=======================================
+
+void reducer_process_main(mr_reducer_t reducer_fn, void *user_arg,
+                          size_t num_threads, size_t queue_size);
+
 //=======================SEZIONE_ANCORA_DA_IMPLEMENTARE=====================================
 /*
 questa struct detta la struttura interna di un'elaboriazione 
@@ -215,17 +221,5 @@ typedef struct {
     mr_value_t  *values;        //array di valori opachi 
     size_t       values_count;
 } mr_group_t;
-
-
-/*
-questa struct indica gli argomenti passati ai thread worker del processo reducer             
-*/
-typedef struct {
-    mr_queue_t   *queue;        //coda dei gruppi da elaborare 
-    mr_reducer_t  reducer_fn;   //callback reducer utente 
-    void         *user_arg;
-    int           out_fd;       // fd di scrittura verso il processo principale 
-    mtx_t        *write_mutex;
-} reducer_worker_arg_t;
 
 #endif

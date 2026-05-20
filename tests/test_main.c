@@ -1,6 +1,7 @@
 #include <stdio.h>
 
 int main(){
-    printf("make test FUNZIONANTE \n");
+    if(0)printf("vero\n");
+    else printf("falso\n");
     return 0;
 }
