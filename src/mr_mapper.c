@@ -1,253 +1,298 @@
+/*
+ * mr_mapper.c
+ *
+ * Implementazione del processo mapper del framework libmr.
+ *
+ * Organizzazione interna:
+ * thread lettore legge righe serializzate da stdin inserisce puntatori 
+ * a mr_line_item_t nella coda quando stdin dà EOF, chiude la coda.                                                            
+ *
+ * 
+ *  N thread worker estraggono righe dalla coda invocano la funzione 
+ *  mapper applicativa scrivono le coppie su stdout (sincronizzato)
+ * 
+ *  dopo la terminazione di tutti i worker:
+ *   il codice di coordinamento chiude stdout
+ 
+ *
+ * La scrittura su stdout è protetta da un mutex C11 (mtx_t) per
+ * evitare il mescolamento di messaggi prodotti da thread diversi.
+ */
+
 #include "mr_internal.h"
+
+
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <stdio.h>
+#include <errno.h>
 #include <threads.h>
+#include <stdatomic.h>
 
-/*
-L'idea generale di questo file e definire la funzione emit che verra usata 
-per scrivere nella pipe che andra al processo dei reducer in modo atomico
-cosi da evitare race condition ed un volta fatto questo sfruttare le fuznioni 
-che gia mi sono definito in mr_pipe.c e mr_queue.c per ricevere ed inviare righe 
-e sincronizzare i thread con un modello produttore consumatore
+/* ------------------------------------------------------------------ */
+/* Strutture interne                                                   */
+/* ------------------------------------------------------------------ */
 
-ho deciso di definire le strucr e i prototipi delle fuznioni realtive ai thread
-mapper direttamente in questo file perche questi prototipi saranno utilizzati solo
-in questo file qui quidni sarebbe inutile scriverli da altre parti
-*/
-
-
-/*
-Argomenti del thread lettore.
-Il lettore legge righe da stdin e le inserisce nella coda
-questa è la coda condivisa gestita con le funzioni implementate in mr_queue.c
- */
+/* Un elemento della coda interna al processo mapper */
 typedef struct {
-    mr_queue_t *queue;   /* coda condivisa con i worker */
-} mapper_reader_arg_t;
+    char         *fname_buf;    /* buffer del nome file (heap)         */
+    char         *line_buf;     /* buffer del contenuto riga (heap)    */
+    mr_file_line_t line;        /* struttura con puntatori a sopra     */
+} mr_line_item_t;
 
-/*
-Questa è la struttuta di una riga logica che poi i thread worker prenderanno
-come input, la struttura di questa riga viene ricostruita dal thread lettore
-prendendo le righe ed estrapolando i dati tramite mr_recv_line()
-e la struttura della riga logica viene messa nella coda condivisa
-grazie alla mr_queue_push()
-
-Una riga letta da stdin dal thread reader, viene allocata e costruita
-da esso e liberata poi dal thread worker che la analizza
- */
+/* Argomento passato ai thread worker */
 typedef struct {
-    char         *file_name;      //nome del file sorgente
-    size_t        file_name_len;
-    unsigned long line_number;
-    char         *line;           //contenuto della riga 
-    size_t        line_len;
-} mapper_line_t;
-
-/*
- Argomenti di ciascun thread worker.
- Ogni worker condivide la stessa coda e lo stesso mutex di scrittura.
- questo è necessario per la sincronizzazione interna dei thread e  per
- la sicnronizzazione in scrittura dato che non l'ho implementata nelle funzioni
- in mr_pipe.c
- */
-typedef struct {
-    mr_queue_t  *queue;        // coda da cui estrarre le righe 
-    mr_mapper_t  mapper_fn;    // callback mapper utente 
-    void        *user_arg;
-    mtx_t       *write_mutex;  // mutex condiviso per scrivere su stdout
+    struct mr    *mr;
+    mr_queue_t   *queue;
+    int           stdout_fd;    /* fd protetto dal mutex               */
+    mtx_t        *write_mtx;   /* mutex per la scrittura su pipe      */
+    atomic_long  *pair_count;  /* contatore atomico coppie prodotte   */
 } mapper_worker_arg_t;
 
-/*
-Implementazione della funzione emit che poi i thread worker usareanno per scrivere
-l'obbiettivo di questa funzione è far si che grazie al mutex condiviso passato grazie
-ad emit_arg di quando si chiama la funzione mapper dell'utente allora tutti i 
-thread worker mapper possano scrivere sicronizzandosi con la solita mutex e
-mandando le copie grazie alla funzione mr_send_pair()
-*/
-
-/*
- Questa struttura viene passata come emit_arg alla funzione mapper utente.
- Contiene tutto il necessario per scrivere la coppia su stdout.
- */
+/* Argomento passato al thread lettore */
 typedef struct {
-    mtx_t *write_mutex;
-}mapper_emit_arg_t;
+    mr_queue_t *queue;
+    int         stdin_fd;
+    atomic_long *line_count;   /* contatore righe lette               */
+} mapper_reader_arg_t;
 
-/*
-Funzione emit passata alla callback mapper utente.
-Serializza la coppia <token, valore> e la scrive su stdout (pipe → reducer).
-La scrittura è protetta dal mutex per evitare interleaving tra thread.
- */
-static int mapper_emit(const char *token, const void *value,
-                       size_t value_size, void *arg)
+/* ------------------------------------------------------------------ */
+/* Funzione emit: chiamata dalla funzione mapper applicativa           */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    int          stdout_fd;
+    mtx_t       *write_mtx;
+    atomic_long *pair_count;
+} emit_pair_ctx_t;
+
+static int emit_pair_fn(const char *token,
+                         const void *value, size_t value_size,
+                         void *emit_arg)
 {
-    mapper_emit_arg_t *ea = (mapper_emit_arg_t *)arg;
+    emit_pair_ctx_t *ctx = (emit_pair_ctx_t *)emit_arg;
 
-    size_t token_len = strlen(token);
+    int token_len = (int)strlen(token);
+    int value_len = (int)value_size;
 
-    //Acquisisce il mutex: scrive l'intera coppia evitando race condition
-    mtx_lock(ea->write_mutex);
-    int ret = mr_send_pair(STDOUT_FILENO, token, token_len,
-                           value, value_size);
-    mtx_unlock(ea->write_mutex);
+    if (token_len <= 0 || token_len > MR_MAX_TOKEN_LEN) {
+        errno = EINVAL; return -1;
+    }
+    if (value_len < 0 || value_len > MR_MAX_VALUE_LEN) {
+        errno = EINVAL; return -1;
+    }
+
+    /* La scrittura sulla pipe deve essere atomica a livello logico:
+     * un intero messaggio non deve essere intervallato da messaggi
+     * di altri thread. Usiamo il mutex dedicato. */
+    mtx_lock(ctx->write_mtx);
+    int ret = proto_write_pair(ctx->stdout_fd,
+                               token, token_len,
+                               value, value_len);
+    mtx_unlock(ctx->write_mtx);
+
+    if (ret == 0)
+        atomic_fetch_add(ctx->pair_count, 1);
 
     return ret;
 }
 
+/* ------------------------------------------------------------------ */
+/* Thread lettore                                                      */
+/* ------------------------------------------------------------------ */
 
-
-/*
-Il THREAD LETTORE MAPPER legge righe serializzate da stdin (pipe dal processo principale),
-ricostruisce una mapper_line_t (linee logiche) per ciascuna e la inserisce nella coda.
-Quando stdin è esaurito (EOF), chiude la coda e termina.
-*/
 static int mapper_reader_main(void *arg)
 {
-    mapper_reader_arg_t *ra = (mapper_reader_arg_t *)arg;
+    mapper_reader_arg_t *a = (mapper_reader_arg_t *)arg;
+
+    LOG_INFO("mapper reader thread avviato");
 
     while(1) {
-        mr_line_header_t hdr;
-        char *file_name = NULL;
-        char *line      = NULL;
+        mr_line_item_t *item = malloc(sizeof(mr_line_item_t));
+        if (!item) {
+            LOG_ERROR("malloc item fallita nel reader");
+            break;
+        }
+        item->fname_buf = NULL;
+        item->line_buf  = NULL;
 
-        int ret = mr_recv_line(STDIN_FILENO, &hdr, &file_name, &line);
-        if (ret == 1) break;   //EOF: nessuna altra riga
-        if (ret < 0) {
-            fprintf(stderr, "[mapper reader] errore lettura riga\n");
+        int r = proto_read_line(STDIN_FILENO,
+                                &item->line,
+                                &item->fname_buf,
+                                &item->line_buf);
+        if (r == 0) {
+            /* EOF: fine input */
+            free(item);
+            break;
+        }
+        if (r < 0) {
+            LOG_ERROR("proto_read_line fallita: %s", strerror(errno));
+            free(item->fname_buf);
+            free(item->line_buf);
+            free(item);
             break;
         }
 
-        //Alloca la struttura per la riga logica e la mette in coda
-        mapper_line_t *ml = malloc(sizeof(mapper_line_t));
-        if (ml == NULL) {
-            free(file_name);
-            free(line);
+        atomic_fetch_add(a->line_count, 1);
+
+        if (queue_push(a->queue, item) < 0) {
+            /* Coda chiusa (non dovrebbe succedere qui) */
+            free(item->fname_buf);
+            free(item->line_buf);
+            free(item);
             break;
         }
-        ml->file_name     = file_name;
-        ml->file_name_len = (size_t)hdr.file_name_len;
-        ml->line_number   = hdr.line_number;
-        ml->line          = line;
-        ml->line_len      = (size_t)hdr.line_len;
-
-        mr_queue_push(ra->queue, ml);
     }
 
-    //qui chiude la coda in modo da segnalare i worker che non arrivano piu messaggi
-    mr_queue_close(ra->queue);
+    queue_close(a->queue);
+    LOG_INFO("mapper reader thread terminato");
     return 0;
 }
 
-/*
- Il THREAD WORKER MAPPER estrae righe dalla coda, invoca la funzione mapper utente su ciascuna,
- e termina quando la coda è vuota e chiusa.
- */
+/* ------------------------------------------------------------------ */
+/* Thread worker mapper                                                */
+/* ------------------------------------------------------------------ */
+
 static int mapper_worker_main(void *arg)
 {
-    mapper_worker_arg_t *wa = (mapper_worker_arg_t *)arg;
+    mapper_worker_arg_t *a = (mapper_worker_arg_t *)arg;
 
-    mapper_emit_arg_t ea;
-    ea.write_mutex = wa->write_mutex;
+    LOG_INFO("mapper worker thread avviato");
 
-    while(1){
-        mapper_line_t *ml = (mapper_line_t *)mr_queue_pop(wa->queue);
-        if (ml == NULL) break;   //coda vuota e chiusa: fine lavoro 
+    emit_pair_ctx_t ctx = {
+        .stdout_fd  = a->stdout_fd,
+        .write_mtx  = a->write_mtx,
+        .pair_count = a->pair_count,
+    };
 
-        //Ricostruisce la struttura pubblica mr_file_line_t (riga logica)
-        mr_file_line_t fl;
-        fl.file_name     = ml->file_name;
-        fl.file_name_len = ml->file_name_len;
-        fl.line_number   = ml->line_number;
-        fl.line          = ml->line;
-        fl.line_len      = ml->line_len;
+    while(1) {
+        void *raw;
+        int r = queue_pop(a->queue, &raw);
+        if (r == 0) break;  /* coda chiusa e vuota */
 
-        //Invoca la callback mapper utente 
-        wa->mapper_fn(&fl, mapper_emit, &ea, wa->user_arg);
+        mr_line_item_t *item = (mr_line_item_t *)raw;
 
-        // Libera la riga: il worker ne è responsabile dopo il pop 
-        free(ml->file_name);
-        free(ml->line);
-        free(ml);
+        /* Invoca la funzione mapper applicativa */
+        int ret = a->mr->mapper(&item->line,
+                                emit_pair_fn, &ctx,
+                                a->mr->user_arg);
+        if (ret < 0) {
+            LOG_WARN("funzione mapper ha restituito errore per riga %lu",
+                     item->line.line_number);
+        }
+
+        free(item->fname_buf);
+        free(item->line_buf);
+        free(item);
     }
 
+    LOG_INFO("mapper worker thread terminato");
     return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* Funzione principale del processo mapper                             */
+/* ------------------------------------------------------------------ */
 
-
-/*
- mapper_process_main() verra chiamata dal processo mapper
- dopo che è stato creato (in seguito alla fork) e dopo che
- stdin e stdout sono stati modificati tramite dup2() per 
- ridirezzionarli rispettivamente alla pipe[0] di [Principale->Mapper]
- e pipe[1] di [Mapper->Reducer].
- 
- Sequenza:
- 1. inizializza la coda e il mutex di scrittura
- 2. avvia il thread lettore
- 3. avvia i thread worker
- 4. attende la terminazione di tutti i thread
- 5. chiude stdout di conseguenza segnala EOF al reducer
- */
-void mapper_process_main(mr_mapper_t mapper_fn, void *user_arg,
-                         size_t num_threads, size_t queue_size)
+void mapper_process_main(struct mr *mr)
 {
-    //Inizializza la coda produttore-consumatore 
+    LOG_INFO("processo mapper avviato (PID %d)", (int)getpid());
+
+    /* Coda produttore-consumatore tra reader e worker */
     mr_queue_t queue;
-    if (mr_queue_init(&queue, queue_size) != 0) {
-        fprintf(stderr, "[mapper] mr_queue_init fallita\n");
-        return;
+    if (queue_init(&queue, mr->queue_size) < 0) {
+        LOG_ERROR("queue_init fallita: %s", strerror(errno));
+        _exit(1);
     }
 
-    //Inizializza il mutex condiviso per la scrittura su stdout 
-    mtx_t write_mutex;
-    if (mtx_init(&write_mutex, mtx_plain) != thrd_success) {
-        fprintf(stderr, "[mapper] mtx_init fallita\n");
-        mr_queue_destroy(&queue);
-        return;
+    /* Mutex per la scrittura serializzata su stdout */
+    mtx_t write_mtx;
+    if (mtx_init(&write_mtx, mtx_plain) != thrd_success) {
+        LOG_ERROR("mtx_init fallita");
+        queue_destroy(&queue);
+        _exit(1);
     }
 
-    //Avvia il thread lettore 
-    mapper_reader_arg_t ra;
-    ra.queue = &queue;
+    /* Contatori atomici */
+    atomic_long line_count = 0;
+    atomic_long pair_count = 0;
 
-    thrd_t reader;
-    thrd_create(&reader, mapper_reader_main, &ra);
+    /* ── Avvio thread lettore ─────────────────────────────────── */
+    mapper_reader_arg_t reader_arg = {
+        .queue      = &queue,
+        .stdin_fd   = STDIN_FILENO,
+        .line_count = &line_count,
+    };
+    thrd_t reader_tid;
+    if (thrd_create(&reader_tid, mapper_reader_main, &reader_arg)
+            != thrd_success) {
+        LOG_ERROR("thrd_create reader fallita");
+        queue_destroy(&queue);
+        mtx_destroy(&write_mtx);
+        _exit(1);
+    }
+    LOG_INFO("thread reader mapper creato");
 
-    //Avvia i thread worker 
-    thrd_t             *workers  = malloc(num_threads * sizeof(thrd_t));
-    mapper_worker_arg_t *wargs   = malloc(num_threads * sizeof(mapper_worker_arg_t));
-
-    for (size_t i = 0; i < num_threads; i++) {
-        wargs[i].queue       = &queue;
-        wargs[i].mapper_fn   = mapper_fn;
-        wargs[i].user_arg    = user_arg;
-        wargs[i].write_mutex = &write_mutex;
-        thrd_create(&workers[i], mapper_worker_main, &wargs[i]);
+    /* ── Avvio thread worker ──────────────────────────────────── */
+    size_t n = mr->mapper_threads;
+    thrd_t *workers = malloc(n * sizeof(thrd_t));
+    mapper_worker_arg_t *wargs = malloc(n * sizeof(mapper_worker_arg_t));
+    if (!workers || !wargs) {
+        LOG_ERROR("malloc worker array fallita");
+        free(workers); free(wargs);
+        queue_close(&queue);
+        thrd_join(reader_tid, NULL);
+        queue_destroy(&queue);
+        mtx_destroy(&write_mtx);
+        _exit(1);
     }
 
-    //Attende il lettore 
-    thrd_join(reader, NULL);
+    for (size_t i = 0; i < n; i++) {
+        wargs[i].mr         = mr;
+        wargs[i].queue      = &queue;
+        wargs[i].stdout_fd  = STDOUT_FILENO;
+        wargs[i].write_mtx  = &write_mtx;
+        wargs[i].pair_count = &pair_count;
 
-    //Attende tutti i worker 
-    for (size_t i = 0; i < num_threads; i++)
+        if (thrd_create(&workers[i], mapper_worker_main, &wargs[i])
+                != thrd_success) {
+            LOG_ERROR("thrd_create worker %zu fallita", i);
+            /* Chiudiamo la coda per sbloccare i worker già avviati */
+            queue_close(&queue);
+            for (size_t j = 0; j < i; j++)
+                thrd_join(workers[j], NULL);
+            thrd_join(reader_tid, NULL);
+            free(workers); free(wargs);
+            queue_destroy(&queue);
+            mtx_destroy(&write_mtx);
+            _exit(1);
+        }
+        LOG_INFO("mapper worker thread %zu creato", i);
+    }
+
+    /* ── Attesa terminazione reader ──────────────────────────── */
+    thrd_join(reader_tid, NULL);
+
+    /* ── Attesa terminazione di tutti i worker ───────────────── */
+    for (size_t i = 0; i < n; i++)
         thrd_join(workers[i], NULL);
 
-    // /Pulizia liberando le risorse
+    LOG_INFO("tutti i thread mapper terminati; righe=%ld coppie=%ld",
+             (long)atomic_load(&line_count),
+             (long)atomic_load(&pair_count));
+
     free(workers);
     free(wargs);
-    mtx_destroy(&write_mutex);
-    mr_queue_destroy(&queue);
+    queue_destroy(&queue);
+    mtx_destroy(&write_mtx);
 
     /*
-    Solo ora chiude stdout.
-    Questo è il segnale di EOF per il processo reducer:
-    tutte le coppie sono state scritte, nessuna andrà perduta.
-    Perche chiudendo stdout si chiude il lato di scrittura della pipe 
-    [Mapper->Reducer] cosi facendo il processo Reducer sa che non 
-    arriverranno piu coppie <token,val>
+     * Solo ORA chiudiamo stdout (la pipe verso il reducer).
+     * Questo invia EOF al reducer e lo informa che non
+     * arriveranno più coppie.
      */
     close(STDOUT_FILENO);
+    LOG_INFO("processo mapper: pipe verso reducer chiusa");
+
+    LOG_INFO("processo mapper terminato");
 }

@@ -1,12 +1,12 @@
 CC      = gcc #compilatore
-CFLAGS  = -std=c11 -Wall -Wextra  -g -I include -I src #flags usati
+CFLAGS  = -std=c11 -Wall -Wextra -D_POSIX_SOURCE=200809L -D_GNU_SOURCE  -g -I include -I src #flags usati
 AR      = ar # Programma per creare librerie statiche
 ARFLAGS = rcs # r = inserisci/aggiorna, c = crea se non esiste, s = aggiungi indice
 
 # File sorgenti della libreria
 LIB_SRCS = src/mr.c         \
            src/mr_queue.c   \
-           src/mr_pipe.c    \
+           src/mr_proto.c    \
            src/mr_mapper.c  \
            src/mr_reducer.c \
            src/mr_log.c     
@@ -16,15 +16,15 @@ LIB_OBJS = $(LIB_SRCS:.c=.o) # Trasforma ogni .c in .o automaticamente
 
 LIB = libmr.a # Nome della libreria statica da produrre
 
-#questo fa si che i comandi sotto i target all test e clean vengono 
+#questo fa si che i comandi sotto i target all, test e clean vengono 
 #eseguiti comunque anche se sono gia presenti file con quei nomi nella
 #directory corrente
 .PHONY: all test clean
 
 #questo è il comando che viene eseguito quando scriviamo make e basta
 #perche è quello di default siccome è il primo trovato e compila 
-#la libreria con l'esempio wordcount 
-all: $(LIB) examples/wordcount
+#la libreria con l'esempio wordcount e print per la visualizzazione
+all: $(LIB) examples/wordcount examples/mr_print
 
 
 # Costruisce la libreria statica impacchettando tutti i .o perche 
@@ -64,4 +64,4 @@ test: tests/test_main
 
 # Rimuove tutti i file generati dalla compilazione
 clean:
-	rm -f $(LIB_OBJS) $(LIB) examples/wordcount tests/test_main 
+	rm -f $(LIB_OBJS) $(LIB) examples/wordcount tests/test_main examples/mr_print 

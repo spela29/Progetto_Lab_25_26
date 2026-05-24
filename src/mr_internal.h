@@ -1,225 +1,209 @@
-#ifndef MR_INT_H
-#define MR_INT_H
+#ifndef MR_INTERNAL_H
+#define MR_INTERNAL_H
+
+/*
+ * Header interno del framework libmr.
+ * Non fa parte dell'interfaccia pubblica e non deve essere incluso
+ * dai programmi applicativi.
+ */
 
 #include "mr.h"
-#include <threads.h>
+
 #include <stddef.h>
+#include <unistd.h>
 #include <sys/types.h>
+#include <threads.h>
+#include <semaphore.h>
 
+/* ------------------------------------------------------------------ */
+/* Limiti ragionevoli per le lunghezze ricevute dal protocollo         */
+/* ------------------------------------------------------------------ */
+#define MR_MAX_TOKEN_LEN     4096   /* lunghezza massima di un token   */
+#define MR_MAX_VALUE_LEN  (1024*1024) /* 1 MiB per valore opaco          */
+#define MR_MAX_RESULT_LEN (1024*1024) /* 1 MiB per un risultato finale   */
+#define MR_MAX_LINE_LEN  (1024*1024*4)  /* 4 MiB per una riga logica       */
+#define MR_MAX_FNAME_LEN  4096      /* lunghezza massima di un nome file*/
 
-//==========================SEZIONE_PIPE=========================================
-/*
-imposto i limiti ragionevoli per gli header passati su pipe 
-*/
-#define MR_MAX_TOKEN_LEN (1024) //1KB
-#define MR_MAX_VALUE_LEN (1024*1024) //1 MB
-#define MR_MAX_LINE_LEN (1024*1024)// 1MB
-#define MR_MAX_FNAME_LEN (4096) //4KB
+/* ------------------------------------------------------------------ */
+/* Struttura interna dell'istanza mr                                   */
+/* ------------------------------------------------------------------ */
+struct mr {
+    /* Configurazione copiata da mr_attr_t */
+    size_t  mapper_threads;
+    size_t  reducer_threads;
+    size_t  queue_size;
+    char   *log_file;           /* stringa allocata, NULL = default    */
 
-/*
-ora voglio definire delle struct che rapresentano gli header dei 
-messaggi scritti su pipe cosi che quando si va a leggere da pipe
-allora il proscesso che legge sa esattamente cosa legge e quanto 
-deve leggere
-*/
-
-/*
-struct che rappresenta l'header che va sulla pipe
-[principale -> mapper]
-*/
-typedef struct {
-    int           file_name_len;// lunghezza nome file, senza '\0' 
-    unsigned long line_number; //numero di riga
-    int           line_len;    //lunghezza contenuto riga, senza '\n' 
-} mr_line_header_t;
-
-
-/*
-struct che rappresenta l'header che va sulla pipe
-[mapper -> reducer]
-*/
-typedef struct {
-    int token_len;  //lunghezza token senza '\0' 
-    int value_len; //lunghezza in byte del val opaco nessun terminatore
-} mr_pair_header_t;
-
-/*
-struct che rappresenta l'header che va sulla pipe
-[reducer-> principale (risultato)]
-*/
-typedef struct {
-    int token_len;//lunghezza token senza '\0' 
-    int result_len;//lunghezza valore dopo la valutazione del reducer
-} mr_result_header_t;
-
-
-/*
-adesso voglio definire i prototipi delle funzioni che uso nel file sorgente 
-mr_pipe.c e voglio definire delle funzioni che fanno praticamente da wrapper
-per le fuznioni readn() e writen() cosi da sfruttare gli header appena definiti
-e le entita del mio framework che voglioni scrivere e leggere su pipe devono appoggiarsi
-e quindi chiamare queste funzioni wrapper che a sua volta useranno le readn() e writen()
-che voglio definire come funzioni che leggono o scrivono n byte
-qundi facedo cosi si creano piu livelli di astrazione 
-*/
-
-
-/*
-legge esattamente n byte dal file descriptor fd nel buffer buf e si ferma in 3 casi
-- trova EOF quidni la pipe è stat chiusa -> ritorno 0
-- c'è stato un problema nella read e la read ritorna val < 0 -> ritorno -1
-- ha finito di leggere tutti i byte richiesti -> ritorno numero byte letti 
-*/
-ssize_t readn(int fd, void *buf, size_t n);
-
-/*
-scrive esattemente n byte dal buffer buf al file puntato dal file descriptor fd
-e si ferma in 2 casi
-- errore nella scrittura allora la write ritorna un val < 0 -> ritorno -1
-- finisce di scrivere tutti i byte -> ritorno il numero di byte scritti
-*/
-ssize_t writen(int fd, const void *buf, size_t n);
-
-/* 
-mr_send_line è quella funzione che si occupa di inviare dal processo principale 
-tutte le informazione per la costruzione delle linee logiche ai thread mapper
-si ferma in 2 casi:
-- se abbiamo un'errore nella scrittura da parte di writen()-> ritorno -1 
-- se abbiamo mandato tutti i byte richiesti -> ritorno 0 
-*/
-int mr_send_line(int fd,
-                 const char *file_name, size_t file_name_len,
-                 unsigned long line_number,
-                 const char *line, size_t line_len);
-
-/*
-mr_recv_line e la funzione che fa coppia con mr_send_line perche è quella che si occupa 
-della ricezione e dell'organizzazione delle informazione che poi serviranno 
-ai thread worker mapper per la risoctruzione della riga logica prima dell'invio 
-della stessa nella funzione mapper passata dal programma utente 
-si ferma in 4 casi:
-- se fallisce la readn() con un errore quindi ritornando un val < 0 -> ritorno -1
-- se fallisce la readn() perche la pipe è chusa ritornado 0 -> ritorno 1
-- se fallisce l'allocazione di memoria -> ritorno -1
-- va tutto a buon fine -> ritorno 0
-*/
-int mr_recv_line(int fd, mr_line_header_t *hdr,
-                 char **file_name_out, char **line_out);
-
-/*
-mr_send_pair ha lo stesso fuznionamanto della fuznione mr_send_pair perche 
-quello che fanno in sostazna è la solita cosa prima mandano un header e dopo le 
-informazioni necessarie 
-*/
-int mr_send_pair(int fd,
-                 const char *token, size_t token_len,
-                 const void *value, size_t value_len);
-
-/*
-mr_recv_pair ha lo stesso funzionamento in sostanza della funzione mr_recv_line 
-perche prendono le informazioni lasciate su pipe dalla fuzione di invio e le danno
-poi al chiamante che riscostruria e dati come piu opportuno e ci fara le operazioni sopra
-pero questa a differenza di mr_recv_line ha un controllo in piu perche la lunghezza del
-dato opaco puo essere 0 ma il principio è lo stesso
-*/
-int mr_recv_pair(int fd,
-                 char **token_out, size_t *token_len_out,
-                 void **value_out, size_t *value_len_out);
-
-/* 
-questa coppia di funzioni che va da Reducer->Principale funzionano
-nello stesso modo di quelle sopra che vanno Mapper->Reducer
-*/
-int mr_send_result(int fd,
-                   const char *token, size_t token_len,
-                   const void *result, size_t result_len);
-int mr_recv_result(int fd,
-                   char **token_out,  size_t *token_len_out,
-                   void **result_out, size_t *result_len_out);
-
-
-//==========================SEZIONE_QUEUE=========================================
-/*
-questa struct mr_queue_info contiene la coda in items che è un array di puntatori
-e tutte le strutture necessarie per la gestione di essa.
-*/
-typedef struct 
-{
-    void** items;//questo è il nostro array di puntatori agli oggitti
-    size_t testa; // testa della coda dove inseriamo gli elementi 
-    size_t coda; // coda della coda da dove estraiamo gli elementi
-    size_t elementi; // elementi presenti nella cosa 
-    size_t capacita;//capacita max della coda
-    mtx_t mutex; // mutex per regolare l'accesso alla coda
-    cnd_t not_full;
-    cnd_t not_empty;
-    int  close; //indiacatore 0 default 1 = non arrivano piu elementi nella coda
-} mr_queue_t;
-
-
-/*
-questa funzione pernde in input il puntatore alla struct per la gestione della coda
-e la capacita della coda, e inizializza i valori iniziali della coda
-ritorna 0 se tutto è andato bene -1 altrimenti.
-*/
-int mr_queue_init(mr_queue_t* q,size_t num_items);
-
-/*
-questa funzione prende in input il puntatore alla struct per la gestione della 
-coda e libera tutte le risorse usate da essa.
-*/
-int mr_queue_destroy(mr_queue_t* q);
-
-/*
-funzione che prende in input le info della coda e un nuovo item da inserire
-e lo inserisce nella coda ritora 0 se è andato tutto bene -1 altrimenti
-*/
-int mr_queue_push(mr_queue_t* q,void* item);
-
-/*
-funzione che prende in input una coda e estrae l'elemento in coda
-ritorna l'elemento se è andato tutto bene NULL altrimenti 
-*/
-void* mr_queue_pop(mr_queue_t* q);
-
-/*
-funzione che prende in input una coda e la chiude 
-non ritorna
-*/
-void mr_queue_close(mr_queue_t* q);
-
-//=======================SEZIONE_MAPPER=====================================
-void mapper_process_main(mr_mapper_t mapper_fn, void *user_arg,
-                         size_t num_threads, size_t queue_size);
-
-
-//=======================SEZIONE_REDUCER=======================================
-
-void reducer_process_main(mr_reducer_t reducer_fn, void *user_arg,
-                          size_t num_threads, size_t queue_size);
-
-//=======================SEZIONE_ANCORA_DA_IMPLEMENTARE=====================================
-/*
-questa struct detta la struttura interna di un'elaboriazione 
-(struct mr)
-*/
-struct mr
-{
-    mr_attr_t attr;//copia gli attributi di config
-    mr_mapper_t mapper;//callback mapper fornita dall'utente
-    mr_reducer_t reducer;//callback reducer fornita dall'utente
-    void* user_arg;// argomento opaco passato alle callback
+    /* Puntatori alle funzioni applicative fornite dall'utente*/
+    mr_mapper_t  mapper;
+    mr_reducer_t reducer;
+    void        *user_arg;
 };
 
+/* ------------------------------------------------------------------------------- */
+/* Sezione dedicata alla definizione di utility per le code produttore consumatore */
+/* ------------------------------------------------------------------------------- */
+
+typedef struct {
+    void   **buf;       /* array circolare di puntatori                */
+    size_t   cap;       /* capacità massima (numero di elementi)       */
+    size_t   head;      /* indice di lettura                           */
+    size_t   tail;      /* indice di scrittura                         */
+    size_t   count;     /* elementi presenti                           */
+    int      closed;    /* 1 quando il produttore ha chiuso la coda    */
+    mtx_t    mtx;
+    cnd_t    not_full;
+    cnd_t    not_empty;
+} mr_queue_t;
 
 /*
-Un gruppo raccoglie tutti i valori associati a uno stesso token,
-pronti per essere passati alla funzione reducer utente.
-*/
+ * Inizializza la coda con capacità cap > 0.
+ * Restituisce 0 in caso di successo, -1 in caso di errore.
+ */
+int  queue_init(mr_queue_t *q, size_t cap);
+
+/*
+ * Distrugge la coda (non libera gli elementi residui: il chiamante
+ * deve farlo prima di chiamare queue_destroy).
+ */
+void queue_destroy(mr_queue_t *q);
+
+/*
+ * Inserisce item nella coda.
+ * Blocca se la coda è piena.
+ * Restituisce 0, oppure -1 se la coda è già chiusa.
+ */
+int  queue_push(mr_queue_t *q, void *item);
+
+/*
+ * Estrae un elemento dalla coda.
+ * Blocca se la coda è vuota E non è chiusa.
+ * Restituisce 1 e pone *item = elemento estratto se disponibile.
+ * Restituisce 0 e pone *item = NULL se la coda è chiusa e vuota
+ * (segnale di fine per il consumatore).
+ */
+int  queue_pop(mr_queue_t *q, void **item);
+
+/*
+ * Marca la coda come chiusa.
+ * Sveglia tutti i consumatori bloccati in attesa.
+ * Dopo questa chiamata, queue_push restituisce -1.
+ */
+void queue_close(mr_queue_t *q);
+
+
+/* ------------------------------------------------------------------ */
+/* Struttura passata al processo mapper (tramite fork – memoria locale)*/
+/* ------------------------------------------------------------------ */
 typedef struct {
-    char        *token;         // stringa C terminata da '\0' 
-    mr_value_t  *values;        //array di valori opachi 
-    size_t       values_count;
-} mr_group_t;
+    struct mr *mr;          /* puntatore all'istanza                   */
+    int        stdin_fd;    /* fd già impostato su stdin dal padre     */
+    int        stdout_fd;   /* fd già impostato su stdout dal padre    */
+} mapper_proc_args_t;
+
+/* ------------------------------------------------------------------ */
+/* Struttura passata al processo reducer                               */
+/* ------------------------------------------------------------------ */
+typedef struct {
+    struct mr *mr;
+    int        stdin_fd;
+    int        stdout_fd;
+    const char *output_path;
+} reducer_proc_args_t;
+
+/* ------------------------------------------------------------------ */
+/* Funzioni dei sotto-processi (definite in mr_mapper.c / mr_reducer.c)*/
+/* ------------------------------------------------------------------ */
+void mapper_process_main(struct mr *mr);
+void reducer_process_main(struct mr *mr, const char *output_path);
+
+/* ------------------------------------------------------------------ */
+/* Funzioni di I/O robuste (definite in mr_proto.c)                   */
+/* ------------------------------------------------------------------ */
+ssize_t readn(int fd, void *buf, size_t n);
+ssize_t writen(int fd, const void *buf, size_t n);
+
+/* ------------------------------------------------------------------ */
+/* Protocollo serializzazione riga logica (main → mapper)             */
+/* ------------------------------------------------------------------ */
+/*
+ * Formato:
+ *   [int fname_len][fname_len byte del nome file]
+ *   [unsigned long line_number]
+ *   [int line_len][line_len byte del contenuto]
+ *
+ * Le lunghezze sono in byte. Non includono il terminatore '\0'.
+ * Lettura: EOF sulla pipe = nessun altro messaggio.
+ */
+int proto_write_line(int fd, const mr_file_line_t *line);
+int proto_read_line(int fd, mr_file_line_t *out,
+                    char **fname_buf, char **line_buf);
+
+/* ------------------------------------------------------------------ */
+/* Protocollo serializzazione coppia (mapper → reducer)               */
+/* ------------------------------------------------------------------ */
+/*
+ * Header:
+ *   typedef struct { int token_len; int value_len; } mr_pair_header_t;
+ * Seguito da:
+ *   [token_len byte del token]
+ *   [value_len byte del valore opaco]
+ */
+typedef struct {
+    int token_len;
+    int value_len;
+} mr_pair_header_t;
+
+int proto_write_pair(int fd, const char *token, int token_len,
+                     const void *value, int value_len);
+int proto_read_pair(int fd, char **token_out, int *token_len_out,
+                    void **value_out, int *value_len_out);
+
+/* ------------------------------------------------------------------ */
+/* Protocollo serializzazione risultato (reducer → main)              */
+/* ------------------------------------------------------------------ */
+/*
+ * Formato:
+ *   [int token_len][token_len byte del token]
+ *   [int result_len][result_len byte del risultato]
+ */
+typedef struct {
+    int token_len;
+    int result_len;
+} mr_result_header_t;
+
+int proto_write_result(int fd, const char *token, int token_len,
+                       const void *result, int result_len);
+int proto_read_result(int fd, char **token_out, int *token_len_out,
+                      void **result_out, int *result_len_out);
+
+/* ------------------------------------------------------------------ */
+/* Funzioni di log (definite in mr_log.c)                             */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Apre il file di log. Da chiamare UNA volta per processo
+ * (main, mapper, reducer) subito dopo il fork.
+ * Se path == NULL viene usato "mr.log".
+ * La scrittura è sincronizzata tramite semaforo POSIX named.
+ */
+int  log_open(const char *path);
+void log_close(void);
+
+/* Scrive una riga di log nel formato:
+ *   [orario] [PID] [TID] [LEVEL] messaggio
+ */
+void log_write(const char *level, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
+
+#define LOG_INFO(...)  log_write("INFO ", __VA_ARGS__)
+#define LOG_ERROR(...) log_write("ERROR", __VA_ARGS__)
+#define LOG_WARN(...)  log_write("WARN ", __VA_ARGS__)
+
+/* ------------------------------------------------------------------ */
+/* Utilità generali                                                    */
+/* ------------------------------------------------------------------ */
+/* Chiude un fd e lo pone a -1 se non è già -1 */
+void safe_close(int *fd);
 
 #endif

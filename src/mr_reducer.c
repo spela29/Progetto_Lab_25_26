@@ -1,352 +1,454 @@
+/*
+ * mr_reducer.c
+ *
+ * Implementazione del processo reducer del framework libmr.
+ *
+ * Organizzazione interna:
+ *
+ *   ┌─────────────────────────────────────────────────────────────┐
+ *   │ Processo reducer                                            │
+ *   │                                                             │
+ *   │  Fase 1 – raccolta (single-thread):                         │
+ *   │    un thread lettore legge tutte le coppie da stdin         │
+ *   │    e le raggruppa in una hash-table per token               │
+ *   │    (struttura: lista di gruppi ordinata per token)          │
+ *   │                                                             │
+ *   │  Fase 2 – riduzione (multithread):                          │
+ *   │    i gruppi completati vengono inseriti in una coda         │
+ *   │    N thread worker estraggono gruppi dalla coda,            │
+ *   │    invocano la funzione reducer applicativa e               │
+ *   │    scrivono i risultati su stdout (sincronizzato)           │
+ *   │                                                             │
+ *   │  Fase 3 – finalizzazione:                                   │
+ *   │    il processo principale aspetta tutti i worker,           │
+ *   │    poi chiude stdout per segnalare la fine al processo main │
+ *   └─────────────────────────────────────────────────────────────┘
+ *
+ * Struttura dati per il raggruppamento:
+ *   Una semplice hash-table open addressing con liste di collisione
+ *   (separate chaining). La chiave è il token (stringa).
+ *   Ogni bucket contiene una lista collegata di token_group_t.
+ *
+ * Output deterministico:
+ *   I gruppi vengono ordinati lessicograficamente per token prima
+ *   di essere inviati ai thread worker. In questo modo, a parità
+ *   di input, l'output è identico tra esecuzioni diverse.
+ *   Se il reducer emette più risultati per lo stesso token,
+ *   l'ordine relativo è quello di emissione della funzione reducer.
+ */
+
 #include "mr_internal.h"
+
+
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <stdio.h>
+#include <errno.h>
 #include <threads.h>
+#include <stdatomic.h>
 
-/*
-come nel file mr_mapper.c definisco direttamente qui le strutture usate soltato da questo file 
-cosiche il file mr_internal.h non sia troppo pieno di dichiarazioni inutili
+/* ------------------------------------------------------------------ */
+/* Hash-table per il raggruppamento                                    */
+/* ------------------------------------------------------------------ */
 
+#define HTABLE_INIT_BUCKETS 4096
 
- qui volgio definire un gruppo, un gruppo raccoglie tutti i valori 
- associati a uno stesso token nel campo values che è appunto un array diamico di 
- valori opachi un gruppo viene costruito dal thread lettore e consumato dai thread worker.
- */
+/* Un singolo valore associato a un token */
+typedef struct value_node {
+    void             *data;
+    size_t            size;
+    struct value_node *next;
+} value_node_t;
+
+/* Gruppo: un token con tutti i suoi valori */
+typedef struct token_group {
+    char             *token;        /* stringa '\0'-terminata          */
+    size_t            token_len;
+    value_node_t     *values_head;  /* lista valori (ordine di arrivo) */
+    value_node_t     *values_tail;
+    size_t            values_count;
+    struct token_group *ht_next;    /* catena nella hash-table         */
+} token_group_t;
+
 typedef struct {
-    char       *token;         //stringa C terminata da '\0' 
-    mr_value_t *values;        //array dinamico di valori opachi 
-    size_t      values_count;  //numero di valori nell'array 
-    size_t      values_cap;    // capacità attuale dell'array 
-} reducer_group_t;
+    token_group_t **buckets;
+    size_t          nbuckets;
+    size_t          ngroups;
+} htable_t;
 
-/*
-Struttura usata per passare i risultati del thread lettore
-al chiamante (reducer_process_main) quidni la coda sincronizzata
-e principalemente la lista dei gruppi appena creati 
-*/
-typedef struct {
-    mr_queue_t      *queue;
-    reducer_group_t *groups;      //array dei gruppi costruiti
-    size_t           group_count;
-} reducer_reader_arg_t;
-
-/*
-Argomenti di ciascun thread worker.
-*/
-typedef struct {
-    mr_queue_t   *queue;        //coda da cui estrarre i gruppi
-    mr_reducer_t  reducer_fn;   // callback reducer utente 
-    void         *user_arg;
-    mtx_t        *write_mutex;  // mutex condiviso per scrivere su stdout
-} reducer_worker_arg_t;
-
-/*
-Argomento della funzione emit passata al reducer utente uguale a quello della funzione
-emit del mapper perche il principio è lo stesso.
- */
-typedef struct {
-    mtx_t *write_mutex;
-} reducer_emit_arg_t;
-
-/*
-In questa sezione mi definisco e scrivo tutte le funzioni che mi servono per 
-la gestione dei gruppi.
-*/
-
-/*
- Cerca un gruppo per token nell'array dei gruppi creati.
- Ritorna il puntatore al gruppo se lo trova, NULL altrimenti.
- */
-static reducer_group_t *find_group(reducer_group_t *groups,//array dei gruppi
-                                   size_t count,//lunghezza array gruppi
-                                    const char *token//token da cercare
-                                    )
+static size_t ht_hash(const char *token, size_t nbuckets)
 {
-    for (size_t i = 0; i < count; i++)
-        if (strcmp(groups[i].token, token) == 0)
-            return &groups[i];
-    return NULL;
+    /* DJB2 */
+    size_t h = 5381;
+    const unsigned char *p = (const unsigned char *)token;
+    while (*p) { h = h * 33 + *p++; }
+    return h % nbuckets;
 }
 
-/*
- Aggiunge un valore a un gruppo esistente copiando i byte grezzi 
- dalla memoria cosi non ci sono problemi ne di tipi ne di 
- interpretazione dei dati intermedi.
- Copia i byte del valore quindi il gruppo possiede la copia.
- Ritorna 0 in caso di successo, -1 in caso di errore.
- */
-static int group_add_value(reducer_group_t *g,
-                           const void *data, size_t size)
+static int ht_init(htable_t *ht, size_t nbuckets)
 {
-    //Espande l'array se necessario 
-    if (g->values_count == g->values_cap) {
-        size_t new_cap = g->values_cap == 0 ? 4 : g->values_cap * 2;
-        mr_value_t *tmp = realloc(g->values,
-                                  new_cap * sizeof(mr_value_t));
-        if (tmp == NULL) return -1;
-        g->values     = tmp;
-        g->values_cap = new_cap;
+    ht->buckets = calloc(nbuckets, sizeof(token_group_t *));
+    if (!ht->buckets) return -1;
+    ht->nbuckets = nbuckets;
+    ht->ngroups  = 0;
+    return 0;
+}
+
+/* Trova o crea il gruppo per 'token'. */
+static token_group_t *ht_get_or_create(htable_t *ht, const char *token,
+                                        size_t token_len)
+{
+    size_t idx = ht_hash(token, ht->nbuckets);
+    token_group_t *g = ht->buckets[idx];
+
+    while (g) {
+        if (strcmp(g->token, token) == 0) return g;
+        g = g->ht_next;
     }
 
-    //Copia il valore opaco 
-    void *copy = NULL;
+    /* Crea un nuovo gruppo */
+    g = malloc(sizeof(token_group_t));
+    if (!g) return NULL;
+    g->token = malloc(token_len + 1);
+    if (!g->token) { free(g); return NULL; }
+    memcpy(g->token, token, token_len + 1);
+    g->token_len    = token_len;
+    g->values_head  = NULL;
+    g->values_tail  = NULL;
+    g->values_count = 0;
+    g->ht_next      = ht->buckets[idx];
+    ht->buckets[idx] = g;
+    ht->ngroups++;
+    return g;
+}
+
+/* Aggiunge un valore (copia dei byte) al gruppo */
+static int group_add_value(token_group_t *g, const void *data, size_t size)
+{
+    value_node_t *vn = malloc(sizeof(value_node_t));
+    if (!vn) return -1;
+    vn->data = NULL;
+    vn->size = size;
+    vn->next = NULL;
     if (size > 0) {
-        copy = malloc(size);
-        if (copy == NULL) return -1;
-        memcpy(copy, data, size);
+        vn->data = malloc(size);
+        if (!vn->data) { free(vn); return -1; }
+        memcpy(vn->data, data, size);
     }
-
-    g->values[g->values_count].data = copy;
-    g->values[g->values_count].size = size;
+    if (g->values_tail) {
+        g->values_tail->next = vn;
+        g->values_tail = vn;
+    } else {
+        g->values_head = g->values_tail = vn;
+    }
     g->values_count++;
     return 0;
 }
 
-/*
- Crea un nuovo gruppo per il token dato.
- Ritorna il puntatore al nuovo gruppo nell'array (dopo realloc),
- o NULL in caso di errore.
- Groups è un puntatore a puntatore perché realloc può spostare l'array
- ho bisogno di un doppio puntatore cosi che io possa modificare in caso 
- di realloc la posizione dell'array anche nel chiamate.
- */
-static reducer_group_t *group_create(reducer_group_t **groups,
-                                     size_t *count, size_t *cap,
-                                     const char *token)
+/* Libera tutti i valori di un gruppo e poi il gruppo stesso */
+static void group_free(token_group_t *g)
 {
-    //Espande l'array dei gruppi se necessario 
-    if (*count == *cap) {
-        size_t new_cap = *cap == 0 ? 16 : *cap * 2;
-        reducer_group_t *tmp = realloc(*groups,
-                                       new_cap * sizeof(reducer_group_t));
-        if (tmp == NULL) return NULL;
-        *groups = tmp;
-        *cap    = new_cap;
+    value_node_t *v = g->values_head;
+    while (v) {
+        value_node_t *next = v->next;
+        free(v->data);
+        free(v);
+        v = next;
     }
-
-    //Inizializza il nuovo gruppo 
-    reducer_group_t *g = &(*groups)[*count];
-    size_t tlen  = strlen(token);
-    g->token     = malloc(tlen + 1);
-    if (g->token == NULL) return NULL;
-    memcpy(g->token, token, tlen + 1);
-    g->values       = NULL;
-    g->values_count = 0;
-    g->values_cap   = 0;
-    (*count)++;
-    return g;
+    free(g->token);
+    free(g);
 }
 
-/*
-Confronto per qsort: ordine lessicografico per token.
-Garantisce output deterministico.
-Si basa tutto su strcmp() che funziona solo se le stringhe 
-finiscono con '\0' per questo ho aggiunto in fondo ad ogni 
-token nelle funzioni di ricezione del file mr_pipe.c il carattere '\0'
- */
-static int group_cmp(const void *a, const void *b)
+/* Raccoglie tutti i gruppi in un array (per l'ordinamento) */
+static token_group_t **ht_to_array(htable_t *ht)
 {
-    const reducer_group_t *ga = (const reducer_group_t *)a;
-    const reducer_group_t *gb = (const reducer_group_t *)b;
+    token_group_t **arr = malloc(ht->ngroups * sizeof(token_group_t *));
+    if (!arr) return NULL;
+    size_t idx = 0;
+    for (size_t i = 0; i < ht->nbuckets; i++) {
+        token_group_t *g = ht->buckets[i];
+        while (g) {
+            arr[idx++] = g;
+            g = g->ht_next;
+        }
+    }
+    return arr;
+}
+
+static int cmp_groups(const void *a, const void *b)
+{
+    const token_group_t *ga = *(const token_group_t **)a;
+    const token_group_t *gb = *(const token_group_t **)b;
     return strcmp(ga->token, gb->token);
 }
 
-/*
- * Libera tutta la memoria di un gruppo.
- */
-static void group_free(reducer_group_t *g)
+static void ht_destroy(htable_t *ht)
 {
-    for (size_t i = 0; i < g->values_count; i++)
-        free((void *)g->values[i].data);//qui libero tutta la memoria puntata dai punatori data
-    free(g->values);
-    free(g->token);
+    free(ht->buckets);
+    ht->buckets  = NULL;
+    ht->nbuckets = 0;
+    ht->ngroups  = 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* Strutture per i thread worker del reducer                          */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    struct mr    *mr;
+    mr_queue_t   *queue;
+    int           stdout_fd;
+    mtx_t        *write_mtx;
+    atomic_long  *result_count;
+} reducer_worker_arg_t;
+
+/* ------------------------------------------------------------------ */
+/* Funzione emit_result: chiamata dalla funzione reducer applicativa   */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    int          stdout_fd;
+    mtx_t       *write_mtx;
+    atomic_long *result_count;
+} emit_result_ctx_t;
+
 /*
-Qui definisco la funzione emit per i reducer che come funzionamento è identica
-a quella dei mapper ma ho bisogno di 2 funzioni divere perche i mapper e i reducer
-mandano 2 cosa diverse e quindi usano 2 funzioni diverese definite in mr_pipe.c
-*/
-
-static int reducer_emit(const char *token, const void *result,
-                        size_t result_size, void *arg)
-{
-    reducer_emit_arg_t *ea = (reducer_emit_arg_t *)arg;
-
-    size_t token_len = strlen(token);
-//aquisico e il lock cosi da mandare i risultati evitando race condition
-    mtx_lock(ea->write_mutex);
-    int ret = mr_send_result(STDOUT_FILENO, token, token_len,
-                             result, result_size);
-    mtx_unlock(ea->write_mutex);
-
-    return ret;
-}
-
-
-/*
-Il thread lettore legge tutte le coppie da stdin e le raggruppa per token.
-Solo dopo EOF inserisce i gruppi completi nella coda.
-
-Qui si vede la differenza tra i mapper e i sorter perche oltre a quello che 
-fanno a livello di valutazione dei dati si differenziano proprio perche 
-mentre e mapper possono lavorare gia da subito i thread reducer
-devono aspettare che la fase di raggruppamento dei riusltatu di uno
-stesso token sia completata questa fase è chiamante di shuffle and sort
-e questa fase nel mio codice è ricoperta dal thread lettore che prima legge 
-tutto fa le sue operazioni e solo dopo inserisce nella struttura condivisa
-
-Questo è il motivo per cui la fase di lettura è separata dalla
-fase di elaborazione: non puoi chiamare il reducer su un token
-finché non sai che hai ricevuto TUTTI i suoi valori.
+ * emit_result_fn – scrive il risultato direttamente sulla pipe.
+ * Il processo principale raccoglierà tutti i risultati e li
+ * riordinerà lessicograficamente prima di scrivere il file di output.
  */
-static int reducer_reader_main(void *arg)
+static int emit_result_fn(const char *token,
+                           const void *result, size_t result_size,
+                           void *emit_arg)
 {
-    reducer_reader_arg_t *ra = (reducer_reader_arg_t *)arg;
+    emit_result_ctx_t *ctx = (emit_result_ctx_t *)emit_arg;
 
-    reducer_group_t *groups = NULL;
-    size_t           count  = 0;
-    size_t           cap    = 0;
+    int tok_len = (int)strlen(token);
+    int res_len = (int)result_size;
 
-    while(1) {
-        char  *token   = NULL;
-        void  *value   = NULL;
-        size_t tok_len = 0;
-        size_t val_len = 0;
-
-        int ret = mr_recv_pair(STDIN_FILENO,
-                               &token, &tok_len,
-                               &value, &val_len);
-        if (ret == 1) break;//pipe chiusa EOF
-        if (ret < 0) {
-            fprintf(stderr, "[reducer reader] errore lettura coppia\n");
-            free(token);
-            free(value);
-            break;
-        }
-
-        reducer_group_t *g = find_group(groups, count, token);
-        if (g == NULL)
-            g = group_create(&groups, &count, &cap, token);
-
-        if (g != NULL)
-            group_add_value(g, value, val_len);
-
-        free(token);
-        free(value);
+    if (tok_len <= 0 || tok_len > MR_MAX_TOKEN_LEN) {
+        errno = EINVAL; return -1;
+    }
+    if (res_len < 0 || res_len > MR_MAX_RESULT_LEN) {
+        errno = EINVAL; return -1;
     }
 
-    //Ordina lessicograficamente 
-    if (count > 0)
-        qsort(groups, count, sizeof(reducer_group_t), group_cmp);
+    mtx_lock(ctx->write_mtx);
+    int r = proto_write_result(ctx->stdout_fd,
+                               token, tok_len,
+                               result, res_len);
+    mtx_unlock(ctx->write_mtx);
 
-    //Salva i risultati nella struttura condivisa 
-    ra->groups      = groups;
-    ra->group_count = count;
+    if (r == 0)
+        atomic_fetch_add(ctx->result_count, 1);
 
-    //Inserisce i gruppi nella coda per i worker 
-    for (size_t i = 0; i < count; i++)
-        mr_queue_push(ra->queue, &groups[i]);
-
-    mr_queue_close(ra->queue);
-    return 0;
+    return r;
 }
 
-/*
-Struttura del thread worker reducer
-*/
+/* ------------------------------------------------------------------ */
+/* Thread worker reducer                                               */
+/* ------------------------------------------------------------------ */
 
 static int reducer_worker_main(void *arg)
 {
-    reducer_worker_arg_t *wa = (reducer_worker_arg_t *)arg;
+    reducer_worker_arg_t *a = (reducer_worker_arg_t *)arg;
 
-    reducer_emit_arg_t ea;
-    ea.write_mutex = wa->write_mutex;
+    LOG_INFO("reducer worker thread avviato");
 
-    while(1) {
-        reducer_group_t *g = (reducer_group_t *)mr_queue_pop(wa->queue);
-        if (g == NULL) break;   //coda vuota e chiusa
+    for (;;) {
+        void *raw;
+        int r = queue_pop(a->queue, &raw);
+        if (r == 0) break;  /* coda chiusa e vuota */
 
-        // Invoca la callback reducer utente con il gruppo completo
-        //producendo quinid un riusltato che verra inviato da emit tramite mr_send_result()
-        wa->reducer_fn(g->token,
-                       g->values,
-                       g->values_count,
-                       reducer_emit, &ea,
-                       wa->user_arg);
+        token_group_t *g = (token_group_t *)raw;
+
+        /* Costruisce l'array mr_value_t per la funzione reducer */
+        mr_value_t *vals = malloc(g->values_count * sizeof(mr_value_t));
+        if (!vals) {
+            LOG_ERROR("malloc vals fallita per token '%s'", g->token);
+            group_free(g);
+            continue;
+        }
+
+        size_t i = 0;
+        value_node_t *vn = g->values_head;
+        while (vn) {
+            vals[i].data = vn->data;
+            vals[i].size = vn->size;
+            i++;
+            vn = vn->next;
+        }
+
+        emit_result_ctx_t ctx = {
+            .stdout_fd    = a->stdout_fd,
+            .write_mtx    = a->write_mtx,
+            .result_count = a->result_count,
+        };
+
+        int ret = a->mr->reducer(g->token,
+                                  vals, g->values_count,
+                                  emit_result_fn, &ctx,
+                                  a->mr->user_arg);
+        if (ret < 0) {
+            LOG_WARN("funzione reducer ha restituito errore per token '%s'",
+                     g->token);
+        }
+
+        free(vals);
+        group_free(g);
     }
 
+    LOG_INFO("reducer worker thread terminato");
     return 0;
 }
 
-/*
-questa funzione verra ciamata dal processo reducer dopo che sara stato creato
-con la fork() e dopo che con le dup2 saranno stati reindirizzati stdin e stdout
-alle pipe corrispondenti ovvero lettura di [Mapper->Reducer] e scrittura di [Reducer->Principale]
-*/
+/* ------------------------------------------------------------------ */
+/* Funzione principale del processo reducer                            */
+/* ------------------------------------------------------------------ */
 
-void reducer_process_main(mr_reducer_t reducer_fn, void *user_arg,
-                          size_t num_threads, size_t queue_size)
+void reducer_process_main(struct mr *mr, const char *output_path)
 {
+    (void)output_path; /* usato solo dal processo principale */
+
+    LOG_INFO("processo reducer avviato (PID %d)", (int)getpid());
+
+    /* ── Fase 1: raccolta di tutte le coppie in memoria ─────────── */
+
+    htable_t ht;
+    if (ht_init(&ht, HTABLE_INIT_BUCKETS) < 0) {
+        LOG_ERROR("ht_init fallita: %s", strerror(errno));
+        _exit(1);
+    }
+
+    long pairs_received = 0;
+
+    for (;;) {
+        char *token = NULL;
+        void *value = NULL;
+        int   token_len, value_len;
+
+        int r = proto_read_pair(STDIN_FILENO,
+                                &token, &token_len,
+                                &value, &value_len);
+        if (r == 0) break;   /* EOF: fine coppie */
+        if (r < 0) {
+            LOG_ERROR("proto_read_pair fallita: %s", strerror(errno));
+            /* Continuiamo a leggere per non bloccare il mapper */
+            break;
+        }
+
+        token_group_t *g = ht_get_or_create(&ht, token, (size_t)token_len);
+        if (!g) {
+            LOG_ERROR("ht_get_or_create fallita per token '%s'", token);
+            free(token); free(value);
+            continue;
+        }
+
+        if (group_add_value(g, value, (size_t)value_len) < 0) {
+            LOG_ERROR("group_add_value fallita");
+        }
+
+        free(token);
+        free(value);
+        pairs_received++;
+    }
+
+    LOG_INFO("reducer: ricevute %ld coppie, %zu token distinti",
+             pairs_received, ht.ngroups);
+
+    /* ── Fase 2: ordinamento e riduzione multithread ─────────────── */
+
+    if (ht.ngroups == 0) {
+        LOG_INFO("reducer: nessun gruppo da ridurre");
+        ht_destroy(&ht);
+        close(STDOUT_FILENO);
+        return;
+    }
+
+    /* Raccoglie i gruppi e li ordina lessicograficamente per token */
+    token_group_t **arr = ht_to_array(&ht);
+    if (!arr) {
+        LOG_ERROR("ht_to_array fallita: %s", strerror(errno));
+        ht_destroy(&ht);
+        _exit(1);
+    }
+    qsort(arr, ht.ngroups, sizeof(token_group_t *), cmp_groups);
+
+    /* Coda e mutex per i thread worker */
     mr_queue_t queue;
-    if (mr_queue_init(&queue, queue_size) != 0) {
-        fprintf(stderr, "[reducer] mr_queue_init fallita\n");
-        return;
+    if (queue_init(&queue, mr->queue_size) < 0) {
+        LOG_ERROR("queue_init reducer fallita: %s", strerror(errno));
+        free(arr); ht_destroy(&ht); _exit(1);
     }
 
-    mtx_t write_mutex;
-    if (mtx_init(&write_mutex, mtx_plain) != thrd_success) {
-        fprintf(stderr, "[reducer] mtx_init fallita\n");
-        mr_queue_destroy(&queue);
-        return;
+    mtx_t write_mtx;
+    if (mtx_init(&write_mtx, mtx_plain) != thrd_success) {
+        LOG_ERROR("mtx_init reducer fallita");
+        queue_destroy(&queue); free(arr); ht_destroy(&ht); _exit(1);
     }
 
-    //Avvia il thread lettore 
-    reducer_reader_arg_t ra;
-    ra.queue       = &queue;
-    ra.groups      = NULL;
-    ra.group_count = 0;
+    atomic_long result_count = 0;
 
-    thrd_t reader;
-    thrd_create(&reader, reducer_reader_main, &ra);
-
-    //Avvia i thread worker 
-    thrd_t              *workers = malloc(num_threads * sizeof(thrd_t));
-    reducer_worker_arg_t *wargs  = malloc(num_threads * sizeof(reducer_worker_arg_t));
-
-    for (size_t i = 0; i < num_threads; i++) {
-        wargs[i].queue       = &queue;
-        wargs[i].reducer_fn  = reducer_fn;
-        wargs[i].user_arg    = user_arg;
-        wargs[i].write_mutex = &write_mutex;
-        thrd_create(&workers[i], reducer_worker_main, &wargs[i]);
+    /* Avvio thread worker */
+    size_t n = mr->reducer_threads;
+    thrd_t *workers = malloc(n * sizeof(thrd_t));
+    reducer_worker_arg_t *wargs = malloc(n * sizeof(reducer_worker_arg_t));
+    if (!workers || !wargs) {
+        LOG_ERROR("malloc worker reducer fallita");
+        free(workers); free(wargs);
+        queue_destroy(&queue); mtx_destroy(&write_mtx);
+        free(arr); ht_destroy(&ht); _exit(1);
     }
 
-    // Attende il lettore 
-    thrd_join(reader, NULL);
+    for (size_t i = 0; i < n; i++) {
+        wargs[i].mr           = mr;
+        wargs[i].queue        = &queue;
+        wargs[i].stdout_fd    = STDOUT_FILENO;
+        wargs[i].write_mtx    = &write_mtx;
+        wargs[i].result_count = &result_count;
 
-    //Attende tutti i worker 
-    for (size_t i = 0; i < num_threads; i++)
+        if (thrd_create(&workers[i], reducer_worker_main, &wargs[i])
+                != thrd_success) {
+            LOG_ERROR("thrd_create reducer worker %zu fallita", i);
+            queue_close(&queue);
+            for (size_t j = 0; j < i; j++) thrd_join(workers[j], NULL);
+            free(workers); free(wargs);
+            queue_destroy(&queue); mtx_destroy(&write_mtx);
+            free(arr); ht_destroy(&ht); _exit(1);
+        }
+        LOG_INFO("reducer worker thread %zu creato", i);
+    }
+
+    /* Inserisce i gruppi ordinati nella coda */
+    for (size_t i = 0; i < ht.ngroups; i++) {
+        if (queue_push(&queue, arr[i]) < 0) {
+            LOG_ERROR("queue_push reducer fallita all'elemento %zu", i);
+            /* Il gruppo non sarà elaborato; lo liberiamo */
+            group_free(arr[i]);
+        }
+    }
+
+    /* Segnala la fine dei gruppi e attende i worker */
+    queue_close(&queue);
+    for (size_t i = 0; i < n; i++)
         thrd_join(workers[i], NULL);
 
-    //Libera i gruppi siccome i worker hanno già finito di usarli 
-    if (ra.groups != NULL) {
-        for (size_t i = 0; i < ra.group_count; i++)
-            group_free(&ra.groups[i]);
-        free(ra.groups);
-    }
+    LOG_INFO("tutti i thread reducer terminati; risultati=%ld",
+             (long)atomic_load(&result_count));
 
-    //Pulizia 
     free(workers);
     free(wargs);
-    mtx_destroy(&write_mutex);
-    mr_queue_destroy(&queue);
+    free(arr);
+    queue_destroy(&queue);
+    mtx_destroy(&write_mtx);
+    ht_destroy(&ht);
 
     /*
-    Chiude stdout solo dopo che tutti i worker hanno terminato.
-    Questo è il segnale di EOF per il processo principale.
+     * Chiudiamo stdout (la pipe verso il processo principale).
+     * Questo invia EOF al processo principale, che sa così che
+     * non arriveranno altri risultati.
      */
     close(STDOUT_FILENO);
+    LOG_INFO("processo reducer: pipe verso main chiusa");
+    LOG_INFO("processo reducer terminato");
 }
