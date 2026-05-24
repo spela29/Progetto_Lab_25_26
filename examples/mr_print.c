@@ -34,7 +34,7 @@ int main(int argc, char **argv)
 
     long n = 0;
 
-    for (;;) {
+    while(1) {
         int token_len;
         if (fread(&token_len, sizeof(token_len), 1, f) != 1) {
             if (feof(f)) break;
