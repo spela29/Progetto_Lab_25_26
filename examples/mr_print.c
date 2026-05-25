@@ -1,21 +1,8 @@
 /*
- * print_output.c
- *
- * Programma ausiliario per stampare in forma leggibile il contenuto
- * del file di output prodotto dal framework libmr.
- *
- * Formato del file di output (come definito in mr.c):
- *   Per ogni record:
- *     [int token_len]    lunghezza del token (senza '\0')
- *     [token_len byte]   token
- *     [int result_len]   lunghezza del risultato
- *     [result_len byte]  risultato (opaco)
- *
- * Questo programma interpreta il campo result come int (contatore).
- * Per l'uso con reducer diversi, modificare la stampa del risultato.
+ * mr_print.c
  *
  * Uso:
- *   ./print_output <file.mro>
+ *   ./mr_print<file.mro>
  */
 
 #include <stdio.h>

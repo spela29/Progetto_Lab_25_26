@@ -1,40 +1,5 @@
 /*
  * mr_proto.c
- *
- * Protocollo di serializzazione dei messaggi sulle pipe.
- *
- * ── Pipe 1: processo principale → processo mapper ──────────────────
- *
- *   Per ogni riga logica:
- *     [int fname_len]           (lunghezza nome file, SENZA '\0')
- *     [fname_len byte]          (nome file)
- *     [unsigned long line_num]  (numero riga, base 1)
- *     [int line_len]            (lunghezza contenuto riga, SENZA '\n')
- *     [line_len byte]           (contenuto riga)
- *
- *   EOF sulla pipe = fine input.
- *
- * ── Pipe 2: processo mapper → processo reducer ──────────────────────
- *
- *   Per ogni coppia <token, valore>:
- *     [mr_pair_header_t]        { int token_len; int value_len; }
- *     [token_len byte]          (token, SENZA '\0')
- *     [value_len byte]          (valore opaco)
- *
- *   EOF sulla pipe = fine coppie.
- *
- * ── Pipe 3: processo reducer → processo principale ──────────────────
- *
- *   Per ogni risultato:
- *     [mr_result_header_t]      { int token_len; int result_len; }
- *     [token_len byte]          (token, SENZA '\0')
- *     [result_len byte]         (risultato opaco)
- *
- *   EOF sulla pipe = fine risultati.
- *
- * Tutte le lunghezze sono di tipo int. Vengono validate prima dell'uso:
- * devono essere >= 0 e non superare i limiti definiti in mr_internal.h.
- * Letture e scritture parziali sono gestite da readn()/writen().
  */
 
 #include "mr_internal.h"
@@ -52,7 +17,7 @@ void safe_close(int *fd) {
 }
 
 /* ------------------------------------------------------------------ */
-/* I/O robusto                                                         */
+/* readn() e writen() fanno fa base alle altre funzioni di questo file */
 /* ------------------------------------------------------------------ */
 
 ssize_t readn(int fd, void *buf, size_t n)
@@ -96,7 +61,7 @@ ssize_t writen(int fd, const void *buf, size_t n)
 }
 
 /* ------------------------------------------------------------------ */
-/* Pipe 1: riga logica (main → mapper)                                 */
+/* Pipe 1: riga logica (main -> mapper)                                 */
 /* ------------------------------------------------------------------ */
 
 int proto_write_line(int fd, const mr_file_line_t *line)
@@ -124,7 +89,7 @@ int proto_write_line(int fd, const mr_file_line_t *line)
  * proto_read_line – legge una riga serializzata dalla pipe.
  *
  * Alloca *fname_buf e *line_buf (il chiamante deve liberarli).
- * Popola *out con puntatori verso quei buffer.
+ * Riempe *out con puntatori verso quei buffer.
  *
  * Restituisce:
  *   1  = riga letta con successo
@@ -196,7 +161,7 @@ int proto_read_line(int fd, mr_file_line_t *out,
 }
 
 /* ------------------------------------------------------------------ */
-/* Pipe 2: coppia <token, valore> (mapper → reducer)                   */
+/* Pipe 2: coppia <token, valore> (mapper -> reducer)                   */
 /* ------------------------------------------------------------------ */
 
 int proto_write_pair(int fd, const char *token, int token_len,
@@ -255,7 +220,7 @@ int proto_read_pair(int fd, char **token_out, int *token_len_out,
 }
 
 /* ------------------------------------------------------------------ */
-/* Pipe 3: risultato (reducer → main)                                  */
+/* Pipe 3: risultato (reducer -> main)                                  */
 /* ------------------------------------------------------------------ */
 
 int proto_write_result(int fd, const char *token, int token_len,

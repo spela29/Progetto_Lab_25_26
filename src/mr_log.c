@@ -3,17 +3,6 @@
  *
  * Modulo di logging del framework libmr.
  *
- * Ogni processo (main, mapper, reducer) chiama log_open() all'avvio
- * e log_close() alla chiusura. L'accesso concorrente al file è
- * sincronizzato tramite un semaforo POSIX named, il cui nome è
- * derivato dal percorso del file di log.
- *
- * Formato di ogni riga:
- *   [YYYY-MM-DD HH:MM:SS.mmm] [PID] [TID] [LEVEL] messaggio
- *
- * TID è il valore restituito da thrd_current() castato a unsigned long.
- * Nel processo principale, dove i thread C11 non sono necessari, TID
- * vale 0 per convenzione.
  */
 
 #include "mr_internal.h"
@@ -113,6 +102,5 @@ void log_write(const char *level, const char *fmt, ...)
     sem_wait(g_log_sem);
     fprintf(g_log_fp, "[%s.%03ld] [%d] [%lu] [%s] %s\n",
             ts, (long)(tv.tv_usec / 1000), (int)pid, tid, level, msg);
-    fflush(g_log_fp);
     sem_post(g_log_sem);
 }

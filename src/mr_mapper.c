@@ -1,22 +1,5 @@
 /*
  * mr_mapper.c
- *
- * Implementazione del processo mapper del framework libmr.
- *
- * Organizzazione interna:
- * thread lettore legge righe serializzate da stdin inserisce puntatori 
- * a mr_line_item_t nella coda quando stdin dà EOF, chiude la coda.                                                            
- *
- * 
- *  N thread worker estraggono righe dalla coda invocano la funzione 
- *  mapper applicativa scrivono le coppie su stdout (sincronizzato)
- * 
- *  dopo la terminazione di tutti i worker:
- *   il codice di coordinamento chiude stdout
- 
- *
- * La scrittura su stdout è protetta da un mutex C11 (mtx_t) per
- * evitare il mescolamento di messaggi prodotti da thread diversi.
  */
 
 #include "mr_internal.h"
@@ -82,10 +65,10 @@ static int emit_pair_fn(const char *token,
         errno = EINVAL; return -1;
     }
 
-    /* La scrittura sulla pipe deve essere atomica a livello logico:
+    /* La scrittura sulla pipe deve essere atomica, a livello logico:
      * un intero messaggio non deve essere intervallato da messaggi
      * di altri thread. Usiamo il mutex dedicato. */
-    mtx_lock(ctx->write_mtx);
+    mtx_lock(ctx->write_mtx);   
     int ret = proto_write_pair(ctx->stdout_fd,
                                token, token_len,
                                value, value_len);
@@ -217,7 +200,7 @@ void mapper_process_main(struct mr *mr)
     atomic_long line_count = 0;
     atomic_long pair_count = 0;
 
-    /* ── Avvio thread lettore ─────────────────────────────────── */
+    /* Avvio thread lettore  */
     mapper_reader_arg_t reader_arg = {
         .queue      = &queue,
         .stdin_fd   = STDIN_FILENO,
@@ -233,7 +216,7 @@ void mapper_process_main(struct mr *mr)
     }
     LOG_INFO("thread reader mapper creato");
 
-    /* ── Avvio thread worker ──────────────────────────────────── */
+    /* Avvio thread worker  */
     size_t n = mr->mapper_threads;
     thrd_t *workers = malloc(n * sizeof(thrd_t));
     mapper_worker_arg_t *wargs = malloc(n * sizeof(mapper_worker_arg_t));
@@ -270,10 +253,10 @@ void mapper_process_main(struct mr *mr)
         LOG_INFO("mapper worker thread %zu creato", i);
     }
 
-    /* ── Attesa terminazione reader ──────────────────────────── */
+    /* Attesa terminazione reader å */
     thrd_join(reader_tid, NULL);
 
-    /* ── Attesa terminazione di tutti i worker ───────────────── */
+    /* Attesa terminazione di tutti i worker  */
     for (size_t i = 0; i < n; i++)
         thrd_join(workers[i], NULL);
 

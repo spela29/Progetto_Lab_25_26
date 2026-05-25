@@ -1,20 +1,6 @@
 /*
- * wordcount.c
- *
- * Programma di esempio che usa libmr per contare le occorrenze dei token
- * in un file o in una directory di file testuali.
- *
  * Uso:
- *   ./wordcount <input> <output>
- *
- * Il mapper emette, per ogni token alfanumerico trovato nella riga,
- * il valore intero 1 (serializzato come int).
- *
- * Il reducer somma tutti gli interi ricevuti per ogni token e
- * emette il totale (serializzato come int).
- *
- * Il file di output è in formato binario (mr_result_header_t + dati).
- * Usare il programma 'print_output' per leggerne il contenuto.
+ * ./wordcount <input> <output>
  */
 
 #include <stdio.h>
@@ -38,8 +24,7 @@ static int wc_mapper(const mr_file_line_t *line,
     size_t      i   = 0;
 
     while (i < len) {
-        /* Salta caratteri non alfanumerici in teoria per la specifica
-        ovvero input di file alfanumerici ASCII non dovrebbe essere necessario */
+        /* Salta caratteri non alfanumerici */
         while (i < len && !isalnum((unsigned char)p[i])) i++;
         if (i >= len) break;
 

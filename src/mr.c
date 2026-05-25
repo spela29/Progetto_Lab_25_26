@@ -7,29 +7,7 @@
  *   - mr_attr_init / mr_attr_destroy / mr_attr_set_*
  *   - mr_create / mr_start / mr_destroy
  *
- * mr_start() realizza la seguente sequenza:
- *
- *   1. Apertura del file di log
- *   2. Scansione dell'input (file singolo o directory)
- *   3. Creazione delle pipe
- *   4. fork() del processo mapper
- *   5. fork() del processo reducer
- *   6. Chiusura dei descrittori non necessari nel processo principale
- *   7. Invio delle righe serializzate al mapper
- *   8. Raccolta dei risultati dal reducer e scrittura del file di output
- *   9. waitpid() dei processi figli
- *
- * Formato del file di output:
- *   Per ogni risultato (ordinato lessicograficamente per token):
- *     [int token_len]    (lunghezza token, SENZA '\0')
- *     [token_len byte]   (token)
- *     [int result_len]   (lunghezza risultato)
- *     [result_len byte]  (risultato opaco)
- *
- *   I risultati arrivano già ordinati dal processo reducer
- *   (che li emette in ordine lessicografico per token).
- *   L'ordine relativo di più risultati per lo stesso token
- *   è quello di emissione della funzione reducer applicativa.
+ 
  */
 
 #include "mr_internal.h"
@@ -71,6 +49,7 @@ int mr_attr_init(mr_attr_t *attr)
 int mr_attr_destroy(mr_attr_t *attr)
 {
     /* log_file punta a memoria dell'utente, non la liberiamo */
+
     (void)attr;
     return 0;
 }
@@ -328,7 +307,7 @@ static int collect_output(int fd, const char *output_path)
     output_record_t *records = NULL;
     size_t count = 0, cap = 0;
 
-    for (;;) {
+    while(1) {
         char *token  = NULL;
         void *result = NULL;
         int   token_len, result_len;
@@ -458,7 +437,7 @@ int mr_start(mr_t mr, const char *input_path, const char *output_path)
     }
     LOG_INFO("file da elaborare: %d", n_files);
 
-    /* ── Creazione pipe ────────────────────────────────────────── */
+    /*---Creazione pipe ------------------ */
     int main_to_mapper[2];
     int mapper_to_reducer[2];
     int reducer_to_main[2];
@@ -477,7 +456,7 @@ int mr_start(mr_t mr, const char *input_path, const char *output_path)
              mapper_to_reducer[0], mapper_to_reducer[1],
              reducer_to_main[0], reducer_to_main[1]);
 
-    /* ── fork() processo mapper ───────────────────────────────── */
+    /*----  fork() processo mapper------------ */
     pid_t mapper_pid = fork();
     if (mapper_pid < 0) {
         LOG_ERROR("fork mapper fallita: %s", strerror(errno));
@@ -490,7 +469,7 @@ int mr_start(mr_t mr, const char *input_path, const char *output_path)
     }
 
     if (mapper_pid == 0) {
-        /* ── Processo mapper ─────────────────────────────────── */
+        /* ------- Processo mapper -------------- */
 
         /* Collega stdin alla pipe proveniente dal principale */
         if (dup2(main_to_mapper[0], STDIN_FILENO) < 0) _exit(1);
@@ -515,7 +494,7 @@ int mr_start(mr_t mr, const char *input_path, const char *output_path)
     }
     LOG_INFO("processo mapper creato (PID %d)", (int)mapper_pid);
 
-    /* ── fork() processo reducer ──────────────────────────────── */
+    /*----fork() processo reducer ----*/
     pid_t reducer_pid = fork();
     if (reducer_pid < 0) {
         LOG_ERROR("fork reducer fallita: %s", strerror(errno));
@@ -530,7 +509,7 @@ int mr_start(mr_t mr, const char *input_path, const char *output_path)
     }
 
     if (reducer_pid == 0) {
-        /* ── Processo reducer ────────────────────────────────── */
+        /* -- Processo reducer ----*/
 
         /* Collega stdin alla pipe proveniente dal mapper */
         if (dup2(mapper_to_reducer[0], STDIN_FILENO) < 0) _exit(1);
@@ -554,7 +533,7 @@ int mr_start(mr_t mr, const char *input_path, const char *output_path)
     }
     LOG_INFO("processo reducer creato (PID %d)", (int)reducer_pid);
 
-    /* ── Processo principale: chiude i lati non necessari ─────── */
+    /* -- Processo principale: chiude i lati non necessari ---- */
     close(main_to_mapper[0]);    /* Non leggiamo da questa pipe      */
     close(mapper_to_reducer[0]); /* Non leggiamo qui (è del mapper)  */
     close(mapper_to_reducer[1]); /* Non scriviamo qui (è del mapper) */
@@ -565,7 +544,7 @@ int mr_start(mr_t mr, const char *input_path, const char *output_path)
      *   reducer_to_main[0] (lettura dal reducer)
      */
 
-    /* ── Invio righe al mapper ────────────────────────────────── */
+    /* -- Invio righe al mapper --- */
     int send_ok = 0;
     for (int i = 0; i < n_files; i++) {
         if (send_file_to_mapper(main_to_mapper[1], input_files[i]) < 0) {
@@ -579,12 +558,12 @@ int mr_start(mr_t mr, const char *input_path, const char *output_path)
     close(main_to_mapper[1]);
     LOG_INFO("invio righe completato; pipe verso mapper chiusa");
 
-    /* ── Raccolta risultati dal reducer ───────────────────────── */
+    /* -- Raccolta risultati dal reducer --*/
     int collect_ok = collect_output(reducer_to_main[0], output_path);
     close(reducer_to_main[0]);
     LOG_INFO("raccolta risultati completata");
 
-    /* ── Attesa terminazione processi figli ───────────────────── */
+    /* -- Attesa terminazione processi figli--*/
     int mapper_status = 0, reducer_status = 0;
     if (waitpid(mapper_pid, &mapper_status, 0) < 0) {
         LOG_ERROR("waitpid mapper fallita: %s", strerror(errno));

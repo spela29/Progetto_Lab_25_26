@@ -1,40 +1,5 @@
 /*
  * mr_reducer.c
- *
- * Implementazione del processo reducer del framework libmr.
- *
- * Organizzazione interna:
- *
- *   ┌─────────────────────────────────────────────────────────────┐
- *   │ Processo reducer                                            │
- *   │                                                             │
- *   │  Fase 1 – raccolta (single-thread):                         │
- *   │    un thread lettore legge tutte le coppie da stdin         │
- *   │    e le raggruppa in una hash-table per token               │
- *   │    (struttura: lista di gruppi ordinata per token)          │
- *   │                                                             │
- *   │  Fase 2 – riduzione (multithread):                          │
- *   │    i gruppi completati vengono inseriti in una coda         │
- *   │    N thread worker estraggono gruppi dalla coda,            │
- *   │    invocano la funzione reducer applicativa e               │
- *   │    scrivono i risultati su stdout (sincronizzato)           │
- *   │                                                             │
- *   │  Fase 3 – finalizzazione:                                   │
- *   │    il processo principale aspetta tutti i worker,           │
- *   │    poi chiude stdout per segnalare la fine al processo main │
- *   └─────────────────────────────────────────────────────────────┘
- *
- * Struttura dati per il raggruppamento:
- *   Una semplice hash-table open addressing con liste di collisione
- *   (separate chaining). La chiave è il token (stringa).
- *   Ogni bucket contiene una lista collegata di token_group_t.
- *
- * Output deterministico:
- *   I gruppi vengono ordinati lessicograficamente per token prima
- *   di essere inviati ai thread worker. In questo modo, a parità
- *   di input, l'output è identico tra esecuzioni diverse.
- *   Se il reducer emette più risultati per lo stesso token,
- *   l'ordine relativo è quello di emissione della funzione reducer.
  */
 
 #include "mr_internal.h"
@@ -255,7 +220,7 @@ static int reducer_worker_main(void *arg)
 
     LOG_INFO("reducer worker thread avviato");
 
-    for (;;) {
+    while(1) {
         void *raw;
         int r = queue_pop(a->queue, &raw);
         if (r == 0) break;  /* coda chiusa e vuota */
@@ -312,7 +277,7 @@ void reducer_process_main(struct mr *mr, const char *output_path)
 
     LOG_INFO("processo reducer avviato (PID %d)", (int)getpid());
 
-    /* ── Fase 1: raccolta di tutte le coppie in memoria ─────────── */
+    /* Fase 1: raccolta di tutte le coppie in memoria  */
 
     htable_t ht;
     if (ht_init(&ht, HTABLE_INIT_BUCKETS) < 0) {
@@ -322,7 +287,7 @@ void reducer_process_main(struct mr *mr, const char *output_path)
 
     long pairs_received = 0;
 
-    for (;;) {
+    while(1) {
         char *token = NULL;
         void *value = NULL;
         int   token_len, value_len;
@@ -356,7 +321,7 @@ void reducer_process_main(struct mr *mr, const char *output_path)
     LOG_INFO("reducer: ricevute %ld coppie, %zu token distinti",
              pairs_received, ht.ngroups);
 
-    /* ── Fase 2: ordinamento e riduzione multithread ─────────────── */
+    /* Fase 2: ordinamento e riduzione multithread  */
 
     if (ht.ngroups == 0) {
         LOG_INFO("reducer: nessun gruppo da ridurre");

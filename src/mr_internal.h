@@ -124,7 +124,7 @@ ssize_t readn(int fd, void *buf, size_t n);
 ssize_t writen(int fd, const void *buf, size_t n);
 
 /* ------------------------------------------------------------------ */
-/* Protocollo serializzazione riga logica (main → mapper)             */
+/* Protocollo serializzazione riga logica (main -> mapper)             */
 /* ------------------------------------------------------------------ */
 /*
  * Formato:
@@ -140,7 +140,7 @@ int proto_read_line(int fd, mr_file_line_t *out,
                     char **fname_buf, char **line_buf);
 
 /* ------------------------------------------------------------------ */
-/* Protocollo serializzazione coppia (mapper → reducer)               */
+/* Protocollo serializzazione coppia (mapper -> reducer)               */
 /* ------------------------------------------------------------------ */
 /*
  * Header:
@@ -160,7 +160,7 @@ int proto_read_pair(int fd, char **token_out, int *token_len_out,
                     void **value_out, int *value_len_out);
 
 /* ------------------------------------------------------------------ */
-/* Protocollo serializzazione risultato (reducer → main)              */
+/* Protocollo serializzazione risultato (reducer -> main)              */
 /* ------------------------------------------------------------------ */
 /*
  * Formato:
@@ -191,14 +191,13 @@ int  log_open(const char *path);
 void log_close(void);
 
 /* Scrive una riga di log nel formato:
- *   [orario] [PID] [TID] [LEVEL] messaggio
+ *   [TEMPO] [PID] [TID] [LEVEL] messaggio
  */
-void log_write(const char *level, const char *fmt, ...)
-    __attribute__((format(printf, 2, 3)));
+void log_write(const char *level, const char *fmt, ...);
 
-#define LOG_INFO(...)  log_write("INFO ", __VA_ARGS__)
+#define LOG_INFO(...)  log_write("INFO", __VA_ARGS__)
 #define LOG_ERROR(...) log_write("ERROR", __VA_ARGS__)
-#define LOG_WARN(...)  log_write("WARN ", __VA_ARGS__)
+#define LOG_WARN(...)  log_write("WARN", __VA_ARGS__)
 
 /* ------------------------------------------------------------------ */
 /* Utilità generali                                                    */
