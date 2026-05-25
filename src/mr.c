@@ -180,7 +180,12 @@ static int collect_input_files(const char *input_path,
             size_t dir_len  = strlen(input_path);
             size_t name_len = strlen(de->d_name);
             char *full = malloc(dir_len + 1 + name_len + 1);
-            if (!full) { closedir(d); goto oom; }
+            if (!full) { 
+                closedir(d);
+                for (size_t i = 0; i < count; i++) free(arr[i]);
+                free(arr);
+                return -1;
+                }
             memcpy(full, input_path, dir_len);
             full[dir_len] = '/';
             memcpy(full + dir_len + 1, de->d_name, name_len + 1);
@@ -194,7 +199,12 @@ static int collect_input_files(const char *input_path,
             if (count == cap) {
                 size_t new_cap = cap ? cap * 2 : 16;
                 char **tmp = realloc(arr, new_cap * sizeof(char *));
-                if (!tmp) { free(full); closedir(d); goto oom; }
+                if (!tmp) { free(full);
+                closedir(d); 
+                for (size_t i = 0; i < count; i++) free(arr[i]);
+                free(arr);
+                return -1;
+                }
                 arr = tmp; cap = new_cap;
             }
             arr[count++] = full;
@@ -209,10 +219,7 @@ static int collect_input_files(const char *input_path,
         *paths_out = arr;
         return (int)count;
 
-    oom:
-        for (size_t i = 0; i < count; i++) free(arr[i]);
-        free(arr);
-        return -1;
+    
     }
 
     errno = EINVAL;
